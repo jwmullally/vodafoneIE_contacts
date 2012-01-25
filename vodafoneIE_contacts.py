@@ -6,11 +6,8 @@
 #
 # The easiest way to fetch this list is logging into the vodafone.ie webmail
 # section, which can export the contact numbers as a csv file.
+# Whenever we detect the session is expired, try re-login once and continue.
 
-# Update Aug 2011: Doesn't work for now, something seems to have changed with 
-#                  the website. Needs some fixin. 
-#                  Firefox with httpfox are a good start - Wireshark etc
-#                  can't decode the intercepted https SSL traffic.
 
 import cookielib
 import urllib
@@ -18,36 +15,50 @@ import urllib2
 import urlparse
 import re
 
-USER_AGENT = 'Mozilla/5.0 (X11; U; Linux i686; en-US; rv:1.9.2.15) Gecko/20110303 Ubuntu/10.04 (lucid) Firefox/3.6.15'
 
 class VodafoneIEMail:
     def __init__(self, username, password, DEBUG=False):
         self.username = username
         self.password = password
         self.cookies = cookielib.CookieJar()
-        self.t = None
+        self.t = ''
         if DEBUG:
-            self.opener = urllib2.build_opener(urllib2.HTTPCookieProcessor(self.cookies), urllib2.HTTPHandler(debuglevel=1), urllib2.HTTPSHandler(debuglevel=1))
+            self.opener = urllib2.build_opener(
+                    urllib2.HTTPCookieProcessor(self.cookies), urllib2.HTTPHandler(debuglevel=1), urllib2.HTTPSHandler(debuglevel=1))
         else:
             self.opener = urllib2.build_opener(urllib2.HTTPCookieProcessor(self.cookies))
-        self.opener.addheaders = [('User-Agent', USER_AGENT)]
+        self.opener.addheaders = [('User-Agent', 'Mozilla/5.0')]
         self.login()
         self.mail_login()
         return
 
+    def _fetchurl(self, url, post=None, fetch_html=True):
+        """Helper function to request url, get html and cleanup connection."""
+        request = urllib2.Request(url, post)
+        response = self.opener.open(request)
+        if fetch_html:
+            html = response.read()
+            response.close()
+            return html, response
+        else:
+            response.close()
+            return None, response
+
     def login(self):
         # Login to the vodafone.ie website to collect the session cookies (JSESSIONID and others)
         self.cookies.clear()
-        self.t = None
+        self.t = ''
+        # Acquire a JSESSIONID cookie
+        self._fetchurl('https://vodafone.ie', fetch_html=False)
+
+        # Do the actual login, and check we can access the vodafone mail page.
         url = 'https://vodafone.ie/myv/services/login/Login.shtml'
         post = urllib.urlencode({'username': self.username, 'password': self.password, 'redirect': '/myv/messaging/vodafonemail/index.jsp'})
-        req = urllib2.Request(url, post)
-        resp = self.opener.open(req)
-        html = resp.read()
+        html, resp = self._fetchurl(url, post)
         if 'https://vodafone.ie/myv/messaging/vodafonemail/index.jsp' != resp.geturl():
-            errmsg = re.search('<div class="error-msg-box">(.+?)</div>', html)
+            errmsg = re.search('module-alert">.+?(<h2>.+?)</div>', html, re.DOTALL)
             if errmsg:
-                raise Exception('Unable to login: ' + errmsg)
+                raise Exception('Unable to login: \n' + errmsg.group(1))
             else:
                 raise Exception('Unable to login: Unknown error (try re-running with DEBUG=True)')
         return
@@ -59,13 +70,10 @@ class VodafoneIEMail:
         # Try to reuse existing login first (from stored cookies)
         # Open the Vodafone Mail link, to get more session IDs and cookies for later use
         url = 'https://vodafone.ie/myv/messaging/vodafonemail/Launch.shtml'
-        req = urllib2.Request(url)
-        resp = self.opener.open(req)
-        html = resp.read()
+        html, resp = self._fetchurl(url)
         if 'Your session has expired' in html or 'webmail1.vodafone.ie' not in resp.geturl():
             self.login()
-            resp = self.opener.open(req)
-            resp.close()
+            _, resp = self._fetchurl(url, fetch_html=False)
         queries = urlparse.parse_qs(urlparse.urlparse(resp.geturl()).query)
         if 'webmail1.vodafone.ie' not in resp.geturl() or 't' not in queries:
             raise Exception('Unable to access Vodafone Webmail (try re-running with DEBUG=True)')
@@ -78,22 +86,19 @@ class VodafoneIEMail:
 
         # It seems necessary to request the New Contact page before submitting
         # the post request, or else we get back a 500 Internal Server Error
-        newcon_baseurl = 'http://webmail1.vodafone.ie:8080/cp/ps/PSPab/new_contact?d=vodafone.ie&u=unusedaddress&st=NewContact1&t='
-        newcon_req = urllib2.Request(newcon_baseurl + self.t)
-        newcon_html = self.opener.open(newcon_req).read()
+        newcon_url = 'http://webmail1.vodafone.ie:8080/cp/ps/PSPab/new_contact?d=vodafone.ie&u=unusedaddress&st=NewContact1&t=' + self.t
+        newcon_html, newcon_resp = self._fetchurl(newcon_url)
         if 'Your session has expired' in newcon_html:
             self.mail_login()
-            newcon_req = urllib2.Request(newcon_baseurl + self.t)
-            self.opener.open(newcon_req).close()
+            self._fetchurl(newcon_url, fetch_html=False)
 
         # Upload the contact information with a post request
-        con_url = 'http://webmail1.vodafone.ie:8080/cp/ps/PSPab/AddContact?d=vodafone.ie&u=unusedaddress&t='+self.t
+        con_url = 'http://webmail1.vodafone.ie:8080/cp/ps/PSPab/AddContact?d=vodafone.ie&u=unusedaddress&t=' + self.t
         con_post = urllib.urlencode({'firstName': new_name, 'homeMobile': new_number})
-        con_req = urllib2.Request(con_url, con_post)
-        con_reply = self.opener.open(con_req).read()
+        con_html, _ = self._fetchurl(con_url, con_post)
         # Note: The 'Contact has been added.' string is commented out 
         # in the html reply from vodafone so it might not be there forever...
-        if 'Contact has been added.' in con_reply:
+        if 'Contact has been added.' in con_html:
             print "['" + new_name + "': '" + new_number + "' has been added to the contact list]"
         else:
             print 'Error adding new contact, (try re-running with DEBUG=True)'
@@ -107,8 +112,7 @@ class VodafoneIEMail:
         # Use the session IDs and cookies to download the CSV file
         url = 'http://webmail1.vodafone.ie:8080/cp/ps/PSPab/Downloader?d=vodafone.ie&c=yes&u=unusedaddress&dhid=contactsDownloader&t=' + self.t
         post = urllib.urlencode({'exportbook': 'PAB://vodafone.ie/unusedaddress/main', 'fileFormat': 'CSV', 'charset': '8859_1', 'Button': 'Export Contacts'})
-        req = urllib2.Request(url, post)
-        csv = self.opener.open(req).read()
+        csv, _ = self._fetchurl(url, post)
         return csv
 
     def get_contacts(self):
@@ -119,22 +123,16 @@ class VodafoneIEMail:
         return [(l[nameidx], l[numidx]) for l in lines[1:]]
 
     def read_contact_pages(self):
-        pass
-
-        url = 'http://webmail1.vodafone.ie:8080/cp/ps/PSPab/viewContacts?d=vodafone.ie&showSync=true&u=unusedaddress&sortField=DISPLAY_NAME&sortDirection=asc&prevSortField=DISPLAY_NAME&t=' + self.t
-        post = urllib.urlencode({'page': '1'})
-        req = urllib2.Request(url, post)
-        html = req.read()
+        pass    # Unimplemented
         # need to parse the results out of the page
         # using the IDs in this list, we can delete contacts
 
     def logout(self):
         mail_logout_url = 'http://webmail1.vodafone.ie:8080/cp/ps/Main/logout/Logout?d=vodafone.ie&u=unusedaddress&t=' + self.t
-        self.opener.open(mail_logout_url).close()
+        self._fetchurl(mail_logout_url, fetch_html=False)
         vodafone_logout_url = 'https://vodafone.ie/myv/services/logout/Logout.shtml'
-        self.opener.open(vodafone_logout_url).close()
-        self.cookies.clear()
-        self.t = None
+        self._fetchurl(vodafone_logout_url, fetch_html=False)
+        self.t = ''
 
     def __del__(self):
         self.logout()
@@ -150,8 +148,8 @@ if __name__ == '__main__':
     vfmail = VodafoneIEMail(username, password)
     for contact in vfmail.get_contacts():
         print 'alias',
-        print contact[0] if ' ' not in contact[0] else '"'+contact[0]+'"',
+        # vodasms doesn't support spaces in names, so replace with underscores.
+        print contact[0].replace(' ', '_'),
         print contact[1]
-        # quoted multiword usernames currently not supported by vodasms etc
 
-    # vfmail.add_contact(username, password, 'Test User', '1234')
+    #vfmail.add_contact('Test User', '1234')
